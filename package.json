@@ -1,0 +1,21 @@
+{
+  "name": "foodflow",
+  "version": "2.0.0",
+  "private": true,
+  "description": "FoodFlow - multi-canteen campus food ordering and management platform",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "npm run dev --prefix server",
+    "dev:client": "npm run dev --prefix client",
+    "build": "npm run build --prefix server && npm run build --prefix client",
+    "start": "npm run start --prefix server",
+    "preview": "npm run preview --prefix client",
+    "seed": "npm run seed --prefix server",
+    "setup": "npm install && npm install --prefix server && npm install --prefix client"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "ISC"
+}
