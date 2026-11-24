@@ -99,6 +99,34 @@ export const verifyPaymentSchema = z.object({
   razorpaySignature: z.string().min(1),
 });
 
+export const createWalletTopupSchema = z.object({
+  amount: z
+    .number()
+    .finite()
+    .min(10, "Minimum recharge is ₹10")
+    .max(10000, "Maximum recharge is ₹10,000"),
+});
+
+export const verifyWalletTopupSchema = z.object({
+  razorpayOrderId: z
+    .string()
+    .trim()
+    .min(1, "Razorpay order ID is required")
+    .max(100)
+    .startsWith("order_", "Invalid Razorpay order ID"),
+  razorpayPaymentId: z
+    .string()
+    .trim()
+    .min(1, "Razorpay payment ID is required")
+    .max(100)
+    .startsWith("pay_", "Invalid Razorpay payment ID"),
+  razorpaySignature: z
+    .string()
+    .trim()
+    .min(1, "Razorpay signature is required")
+    .max(200),
+});
+
 export const topupSchema = z.object({
   amount: z.number().min(10, "Minimum top-up is ₹10").max(10000, "Maximum top-up is ₹10,000"),
 });

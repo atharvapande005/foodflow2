@@ -5,8 +5,8 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-export function formatCurrency(n: number): string {
-  return `₹${n.toFixed(0)}`;
+export function formatCurrency(n?: number | null): string {
+  return `₹${Number(n ?? 0).toFixed(0)}`;
 }
 
 export function timeAgo(date: string | Date): string {

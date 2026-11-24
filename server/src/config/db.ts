@@ -86,19 +86,25 @@ const startEmbedded = async (dbPath?: string, version?: string): Promise<string>
 export const connectDB = async (): Promise<void> => {
   const uri = process.env.MONGODB_URI;
 
+
   if (uri) {
     try {
       const conn = await mongoose.connect(uri);
       console.log(`[Database] MongoDB Connected: ${conn.connection.host}`);
       return;
     } catch (error) {
-      // Never print the connection string: it contains the database password.
-      console.warn(
-        `[Database] Could not connect to the configured MongoDB: ${error instanceof Error ? error.message : "Unknown error"}`
+      console.error(
+        `[Database] MongoDB connection failed: ${error instanceof Error ? error.message : "Unknown error"
+        }`
       );
-      console.warn("[Database] Falling back to the embedded database...");
+      throw new Error("Could not connect to the configured MongoDB database.");
     }
   }
+
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("MONGODB_URI is required in production.");
+  }
+
 
   try {
     const version = preferredBinaryVersion();
