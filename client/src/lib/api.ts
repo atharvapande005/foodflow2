@@ -542,7 +542,13 @@ export const revenueAPI = {
 
 export const walletAPI = {
   getBalance: () => api.get<{ walletBalance: number }>("/wallet/balance"),
-  topup: (amount: number) => api.post<{ walletBalance: number; transaction: Transaction }>("/wallet/topup", { amount }),
+  createTopupOrder: (amount: number) =>
+    api.post<{
+      topupId: string;
+      payment: { keyId: string | null; razorpayOrderId: string; amount: number; currency: string };
+    }>("/wallet/topup/order", { amount }),
+  verifyTopup: (data: { razorpayOrderId: string; razorpayPaymentId: string; razorpaySignature: string }) =>
+    api.post<{ message: string; duplicate: boolean; walletBalance?: number }>("/wallet/topup/verify", data),
   getTransactions: () => api.get<{ transactions: Transaction[] }>("/wallet/transactions"),
 };
 

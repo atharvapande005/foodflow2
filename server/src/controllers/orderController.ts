@@ -176,11 +176,6 @@ export const createOrder = async (req: AuthenticatedRequest, res: Response): Pro
 
     const io = req.app.get("io");
     if (io) {
-      io.emit("order:created", {
-        orderId: order._id,
-        orderNumber: order.orderNumber,
-        canteenId: prepared.canteen._id,
-      });
       io.to(`canteen-${prepared.canteen._id}`).emit("order:created", {
         orderId: order._id,
         orderNumber: order.orderNumber,
@@ -382,7 +377,9 @@ export const updateOrderStatus = async (req: AuthenticatedRequest, res: Response
 
     const io = req.app.get("io");
     if (io) {
-      io.emit("order:updated", { orderId: order._id, status: order.status });
+      if (order.user) {
+        io.to(`user-${order.user}`).emit("order:updated", { orderId: order._id, status: order.status });
+      }
       io.to(`order-${order._id}`).emit("order:status", {
         status: order.status,
         paymentStatus: order.paymentStatus,

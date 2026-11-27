@@ -26,16 +26,26 @@ const DEFAULT_MENU = [
   { name: "Chocolate Shake", description: "Rich chocolate milkshake", category: "Beverages", price: 60, emoji: "🍫", popular: false, available: true, preparationTime: 5, defaultStock: 35 },
 ];
 
+const DEFAULT_ADMIN_PASSWORD = "Admin@12345";
+const DEMO_OWNER_EMAIL = "owner@foodflow.demo";
+const DEMO_OWNER_PASSWORD = "Owner@12345";
+
 async function ensureAdmin(): Promise<void> {
   const adminEmail = process.env.ADMIN_EMAIL || "admin@foodflow.app";
   const existingAdmin = await User.findOne({ role: "ADMIN" });
   if (existingAdmin) return;
 
-  const adminPassword = process.env.ADMIN_PASSWORD || "Admin@12345";
+  const production = process.env.NODE_ENV === "production";
+  if (production && !process.env.ADMIN_PASSWORD) {
+    console.error("[Seed] No administrator exists and ADMIN_PASSWORD is not set. Set ADMIN_EMAIL and ADMIN_PASSWORD, then restart.");
+    return;
+  }
+
+  const adminPassword = process.env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
   if (process.env.ADMIN_PASSWORD) {
     console.warn("[Seed] Admin password read from env - change it after first login.");
   } else {
-    console.warn("[Seed] No ADMIN_PASSWORD set, created admin with default password. Set ADMIN_PASSWORD in .env.");
+    console.warn("[Seed] No ADMIN_PASSWORD set, created admin with the default development password. Set ADMIN_PASSWORD in .env.");
   }
   const passwordHash = await bcrypt.hash(adminPassword, 10);
   await User.create({
@@ -48,12 +58,17 @@ async function ensureAdmin(): Promise<void> {
   console.log(`[Seed] Created administrator account: ${adminEmail}`);
 }
 
-async function ensureDemoOwner(): Promise<InstanceType<typeof User>> {
-  const email = "owner@foodflow.demo";
+/**
+ * The demo owner has a published password, so it is only created on request
+ * (SEED_DEMO_OWNER=true) and never in production.
+ */
+async function ensureDemoOwner(): Promise<InstanceType<typeof User> | null> {
+  if (process.env.SEED_DEMO_OWNER !== "true" || process.env.NODE_ENV === "production") return null;
+  const email = DEMO_OWNER_EMAIL;
   const existing = await User.findOne({ email });
   if (existing) return existing;
 
-  const passwordHash = await bcrypt.hash("Owner@12345", 10);
+  const passwordHash = await bcrypt.hash(DEMO_OWNER_PASSWORD, 10);
   const owner = await User.create({
     name: "Demo Canteen Owner",
     email,
@@ -62,7 +77,7 @@ async function ensureDemoOwner(): Promise<InstanceType<typeof User>> {
     phone: "+91 90000 00001",
     walletBalance: 0,
   });
-  console.log(`[Seed] Created demo owner: ${email} (Owner@12345)`);
+  console.log(`[Seed] Created demo owner: ${email} (development only)`);
   return owner;
 }
 
@@ -72,7 +87,7 @@ async function ensureDefaultCanteen(): Promise<InstanceType<typeof Canteen>> {
 
   const owner = await ensureDemoOwner();
   const canteen = await Canteen.create({
-    ownerId: owner._id,
+    ownerId: owner ? owner._id : null,
     name: "Main Canteen",
     code: "MAIN",
     description: "The original campus canteen. Fresh meals, snacks and beverages served all day.",
@@ -102,8 +117,29 @@ async function ensureDefaultCanteen(): Promise<InstanceType<typeof Canteen>> {
   return canteen;
 }
 
+/**
+ * In production, any account that still uses a published default password is
+ * deactivated so it cannot be used to log in.
+ */
+async function lockDefaultAccounts(): Promise<void> {
+  if (process.env.NODE_ENV !== "production") return;
+  const known: { email: string; password: string }[] = [
+    { email: DEMO_OWNER_EMAIL, password: DEMO_OWNER_PASSWORD },
+    { email: process.env.ADMIN_EMAIL || "admin@foodflow.app", password: DEFAULT_ADMIN_PASSWORD },
+  ];
+  for (const entry of known) {
+    const user = await User.findOne({ email: entry.email });
+    if (user && user.isActive && (await bcrypt.compare(entry.password, user.passwordHash))) {
+      user.isActive = false;
+      await user.save();
+      console.error(`[Security] ${entry.email} still used a default password and was deactivated. Reset its password directly in the database.`);
+    }
+  }
+}
+
 export async function seedIfEmpty(): Promise<void> {
   await ensureAdmin();
+  await lockDefaultAccounts();
   const canteen = await ensureDefaultCanteen();
 
   const menuCount = await MenuItem.countDocuments();

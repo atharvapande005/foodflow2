@@ -18,8 +18,12 @@ function tokenText(token?: number | null): string {
 }
 
 function errorMessage(err: unknown, fallback: string): string {
-  return (err as { response?: { data?: { error?: string } } })?.response?.data?.error || fallback;
+  const data = (err as { response?: { data?: { error?: string; errors?: { guestPhone?: { _errors?: string[] } } } } })
+    ?.response?.data;
+  return data?.error || data?.errors?.guestPhone?._errors?.[0] || fallback;
 }
+
+const PHONE_PATTERN = /^[+]?[0-9][0-9\s-]{8,14}$/;
 
 const STATUS_STEPS: { key: PublicOrder["status"]; label: string }[] = [
   { key: "PLACED", label: "Placed" },
@@ -138,6 +142,10 @@ export default function PublicQrPage() {
     event.preventDefault();
     if (!cart.length) return;
     if (!guestName.trim()) return;
+    if (!PHONE_PATTERN.test(guestPhone.trim())) {
+      alert("Please enter a valid phone number so the canteen can reach you about this order.");
+      return;
+    }
     if (total < canteen.settings.minOrderAmount) return;
 
     setPlacing(true);
@@ -146,7 +154,7 @@ export default function PublicQrPage() {
         canteenCode: canteen.code,
         items: cart.map((line) => ({ menuItem: line.item._id, quantity: line.quantity })),
         guestName: guestName.trim(),
-        guestPhone: guestPhone.trim() || undefined,
+        guestPhone: guestPhone.trim(),
         notes: notes.trim() || undefined,
       });
       setPlaced(res.data.order);
@@ -345,11 +353,13 @@ export default function PublicQrPage() {
                     />
                   </label>
                   <label>
-                    Phone (optional)
+                    Phone
                     <input
+                      type="tel"
                       value={guestPhone}
                       onChange={(event) => setGuestPhone(event.target.value)}
                       placeholder="+91…"
+                      required
                     />
                   </label>
                 </div>

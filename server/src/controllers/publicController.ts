@@ -92,6 +92,20 @@ export const createPublicOrder = async (req: Request, res: Response): Promise<vo
       return;
     }
 
+
+    const openUnpaid = await Order.countDocuments({
+      orderSource: "GUEST",
+      guestPhone: validation.data.guestPhone,
+      paymentStatus: "PENDING",
+      status: { $in: ["PLACED", "PREPARING", "READY"] },
+    });
+    if (openUnpaid >= 3) {
+      res.status(429).json({
+        error: "You already have 3 unpaid orders. Please collect and pay for them at the counter first.",
+      });
+      return;
+    }
+
     const prepared = await prepareOrder({
       items: validation.data.items,
       canteenId: canteen._id.toString(),
@@ -238,12 +252,12 @@ export const getPublicSession = async (req: Request, res: Response): Promise<voi
     res.status(200).json({
       session: session
         ? {
-            _id: session._id,
-            status: session.status,
-            openedAt: session.openedAt,
-            closedAt: session.closedAt,
-            lastToken: session.tokenCounter,
-          }
+          _id: session._id,
+          status: session.status,
+          openedAt: session.openedAt,
+          closedAt: session.closedAt,
+          lastToken: session.tokenCounter,
+        }
         : null,
     });
   } catch (error) {

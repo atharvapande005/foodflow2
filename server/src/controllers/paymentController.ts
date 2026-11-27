@@ -253,7 +253,9 @@ export const verifyOnlinePayment = async (req: AuthenticatedRequest, res: Respon
     const paid = result.order || order;
     const io = req.app.get("io");
     if (io) {
-      io.emit("order:updated", { orderId: paid._id, status: paid.status, paymentStatus: "PAID" });
+      if (paid.user) {
+        io.to(`user-${paid.user}`).emit("order:updated", { orderId: paid._id, status: paid.status, paymentStatus: "PAID" });
+      }
       io.to(`order-${paid._id}`).emit("order:status", { status: paid.status, paymentStatus: "PAID" });
       if (paid.canteen) {
         io.to(`canteen-${paid.canteen}`).emit("order:created", {

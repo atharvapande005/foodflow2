@@ -1,0 +1,850 @@
+From 6002b8f2f812bfb3ec2743035a0d224fd5583569 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 27 Nov 2026 06:49:14 +0000
+Subject: [PATCH] Fix 8 security issues: remove free wallet top-up, enforce JWT
+ secret, lock default accounts, authenticate sockets, add rate limits, cap
+ guest orders, restrict CORS
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EoaYsHxiM222uD2z2iYHB2
+---
+ client/src/lib/api.ts                       |   8 +-
+ client/src/lib/razorpay.ts                  |  39 +++++++
+ client/src/pages/MenuPage.tsx               |  40 +------
+ client/src/pages/PublicQrPage.tsx           |  16 ++-
+ client/src/pages/WalletPage.tsx             |  70 ++++++++++--
+ server/.env.example                         |  15 ++-
+ server/package-lock.json                    |  52 +++++++++
+ server/package.json                         |   1 +
+ server/src/controllers/orderController.ts   |   9 +-
+ server/src/controllers/paymentController.ts |   4 +-
+ server/src/controllers/publicController.ts  |  13 +++
+ server/src/seedIfEmpty.ts                   |  50 +++++++--
+ server/src/server.ts                        | 112 ++++++++++++++++++--
+ server/src/utils/auth.ts                    |  44 +++++++-
+ server/src/utils/validation.ts              |   7 +-
+ 15 files changed, 398 insertions(+), 82 deletions(-)
+ create mode 100644 client/src/lib/razorpay.ts
+
+diff --git a/client/src/lib/api.ts b/client/src/lib/api.ts
+index cce4ec0..d1990a3 100644
+--- a/client/src/lib/api.ts
++++ b/client/src/lib/api.ts
+@@ -542,7 +542,13 @@ export const revenueAPI = {
+ 
+ export const walletAPI = {
+   getBalance: () => api.get<{ walletBalance: number }>("/wallet/balance"),
+-  topup: (amount: number) => api.post<{ walletBalance: number; transaction: Transaction }>("/wallet/topup", { amount }),
++  createTopupOrder: (amount: number) =>
++    api.post<{
++      topupId: string;
++      payment: { keyId: string | null; razorpayOrderId: string; amount: number; currency: string };
++    }>("/wallet/topup/order", { amount }),
++  verifyTopup: (data: { razorpayOrderId: string; razorpayPaymentId: string; razorpaySignature: string }) =>
++    api.post<{ message: string; duplicate: boolean; walletBalance?: number }>("/wallet/topup/verify", data),
+   getTransactions: () => api.get<{ transactions: Transaction[] }>("/wallet/transactions"),
+ };
+ 
+diff --git a/client/src/lib/razorpay.ts b/client/src/lib/razorpay.ts
+new file mode 100644
+index 0000000..73a9fc4
+--- /dev/null
++++ b/client/src/lib/razorpay.ts
+@@ -0,0 +1,39 @@
++export interface RazorpayCheckoutResponse {
++  razorpay_order_id: string;
++  razorpay_payment_id: string;
++  razorpay_signature: string;
++}
++
++export interface RazorpayOptions {
++  key: string;
++  amount: number;
++  currency: string;
++  name: string;
++  description: string;
++  order_id: string;
++  handler: (response: RazorpayCheckoutResponse) => void;
++  modal?: { ondismiss?: () => void };
++  prefill?: { name?: string; email?: string; contact?: string };
++  theme?: { color?: string };
++}
++
++declare global {
++  interface Window {
++    Razorpay?: new (options: RazorpayOptions) => { open: () => void };
++  }
++}
++
++/** Loads Razorpay Checkout once. Resolves false if the script cannot be loaded. */
++export function loadRazorpayScript(): Promise<boolean> {
++  return new Promise((resolve) => {
++    if (window.Razorpay) {
++      resolve(true);
++      return;
++    }
++    const script = document.createElement("script");
++    script.src = "https://checkout.razorpay.com/v1/checkout.js";
++    script.onload = () => resolve(true);
++    script.onerror = () => resolve(false);
++    document.body.appendChild(script);
++  });
++}
+diff --git a/client/src/pages/MenuPage.tsx b/client/src/pages/MenuPage.tsx
+index 401323e..0e3bb87 100644
+--- a/client/src/pages/MenuPage.tsx
++++ b/client/src/pages/MenuPage.tsx
+@@ -8,6 +8,7 @@ import { useAuth } from "@/lib/auth";
+ import { useCanteen } from "@/lib/canteen";
+ import { menuAPI, orderAPI, paymentAPI, type MenuItem } from "@/lib/api";
+ import { formatCurrency } from "@/lib/utils";
++import { loadRazorpayScript } from "@/lib/razorpay";
+ 
+ interface CartEntry {
+   item: MenuItem;
+@@ -22,45 +23,6 @@ interface PlacedOrder {
+   paymentStatus: string;
+ }
+ 
+-interface RazorpayCheckoutResponse {
+-  razorpay_order_id: string;
+-  razorpay_payment_id: string;
+-  razorpay_signature: string;
+-}
+-
+-interface RazorpayOptions {
+-  key: string;
+-  amount: number;
+-  currency: string;
+-  name: string;
+-  description: string;
+-  order_id: string;
+-  handler: (response: RazorpayCheckoutResponse) => void;
+-  modal?: { ondismiss?: () => void };
+-  prefill?: { name?: string; email?: string; contact?: string };
+-  theme?: { color?: string };
+-}
+-
+-declare global {
+-  interface Window {
+-    Razorpay?: new (options: RazorpayOptions) => { open: () => void };
+-  }
+-}
+-
+-function loadRazorpayScript(): Promise<boolean> {
+-  return new Promise((resolve) => {
+-    if (window.Razorpay) {
+-      resolve(true);
+-      return;
+-    }
+-    const script = document.createElement("script");
+-    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+-    script.onload = () => resolve(true);
+-    script.onerror = () => resolve(false);
+-    document.body.appendChild(script);
+-  });
+-}
+-
+ function tokenText(token?: number | null): string {
+   if (!token) return "—";
+   return `#${String(token).padStart(3, "0")}`;
+diff --git a/client/src/pages/PublicQrPage.tsx b/client/src/pages/PublicQrPage.tsx
+index b1c620a..b90c41a 100644
+--- a/client/src/pages/PublicQrPage.tsx
++++ b/client/src/pages/PublicQrPage.tsx
+@@ -18,9 +18,13 @@ function tokenText(token?: number | null): string {
+ }
+ 
+ function errorMessage(err: unknown, fallback: string): string {
+-  return (err as { response?: { data?: { error?: string } } })?.response?.data?.error || fallback;
++  const data = (err as { response?: { data?: { error?: string; errors?: { guestPhone?: { _errors?: string[] } } } } })
++    ?.response?.data;
++  return data?.error || data?.errors?.guestPhone?._errors?.[0] || fallback;
+ }
+ 
++const PHONE_PATTERN = /^[+]?[0-9][0-9\s-]{8,14}$/;
++
+ const STATUS_STEPS: { key: PublicOrder["status"]; label: string }[] = [
+   { key: "PLACED", label: "Placed" },
+   { key: "PREPARING", label: "Preparing" },
+@@ -138,6 +142,10 @@ export default function PublicQrPage() {
+     event.preventDefault();
+     if (!cart.length) return;
+     if (!guestName.trim()) return;
++    if (!PHONE_PATTERN.test(guestPhone.trim())) {
++      alert("Please enter a valid phone number so the canteen can reach you about this order.");
++      return;
++    }
+     if (total < canteen.settings.minOrderAmount) return;
+ 
+     setPlacing(true);
+@@ -146,7 +154,7 @@ export default function PublicQrPage() {
+         canteenCode: canteen.code,
+         items: cart.map((line) => ({ menuItem: line.item._id, quantity: line.quantity })),
+         guestName: guestName.trim(),
+-        guestPhone: guestPhone.trim() || undefined,
++        guestPhone: guestPhone.trim(),
+         notes: notes.trim() || undefined,
+       });
+       setPlaced(res.data.order);
+@@ -345,11 +353,13 @@ export default function PublicQrPage() {
+                     />
+                   </label>
+                   <label>
+-                    Phone (optional)
++                    Phone
+                     <input
++                      type="tel"
+                       value={guestPhone}
+                       onChange={(event) => setGuestPhone(event.target.value)}
+                       placeholder="+91…"
++                      required
+                     />
+                   </label>
+                 </div>
+diff --git a/client/src/pages/WalletPage.tsx b/client/src/pages/WalletPage.tsx
+index f7b0cb9..2bcd73a 100644
+--- a/client/src/pages/WalletPage.tsx
++++ b/client/src/pages/WalletPage.tsx
+@@ -4,6 +4,7 @@ import { useAuth } from "@/lib/auth";
+ import { useToast } from "@/lib/toast";
+ import { walletAPI, type Transaction } from "@/lib/api";
+ import { formatCurrency, getStatusColor, timeAgo } from "@/lib/utils";
++import { loadRazorpayScript } from "@/lib/razorpay";
+ 
+ export default function WalletPage() {
+   const { user, updateWallet } = useAuth();
+@@ -20,22 +21,75 @@ export default function WalletPage() {
+       .finally(() => setLoading(false));
+   }, []);
+ 
++  const errorText = (err: unknown, fallback: string): string =>
++    (err as { response?: { data?: { error?: string } } })?.response?.data?.error || fallback;
++
++  const reloadTransactions = () =>
++    walletAPI
++      .getTransactions()
++      .then((r) => setTransactions(r.data.transactions))
++      .catch(() => undefined);
++
++  // The wallet is only credited after Razorpay confirms the payment to our server.
+   const handleTopup = async () => {
+     const val = parseInt(amount);
+     if (!val || val < 10) {
+       toast("Minimum top-up is ₹10");
+       return;
+     }
++    if (val > 10000) {
++      toast("Maximum top-up is ₹10,000");
++      return;
++    }
+     setTopping(true);
+     try {
+-      const res = await walletAPI.topup(val);
+-      updateWallet(res.data.walletBalance);
+-      setTransactions((prev) => [res.data.transaction, ...prev]);
+-      setAmount("");
+-      toast(`₹${val} added to wallet!`);
+-    } catch {
+-      toast("Top-up failed. Try again.");
+-    } finally {
++      const created = await walletAPI.createTopupOrder(val);
++      const ready = await loadRazorpayScript();
++      if (!ready || !window.Razorpay || !created.data.payment.keyId) {
++        toast("Could not open the payment window. Check your connection and try again.");
++        setTopping(false);
++        return;
++      }
++      const payment = created.data.payment;
++      const checkout = new window.Razorpay({
++        key: payment.keyId as string,
++        amount: payment.amount,
++        currency: payment.currency,
++        name: "FoodFlow wallet",
++        description: `Add ₹${val} to wallet`,
++        order_id: payment.razorpayOrderId,
++        prefill: { name: user?.name, email: user?.email, contact: user?.phone },
++        handler: async (response) => {
++          try {
++            const verified = await walletAPI.verifyTopup({
++              razorpayOrderId: response.razorpay_order_id,
++              razorpayPaymentId: response.razorpay_payment_id,
++              razorpaySignature: response.razorpay_signature,
++            });
++            if (typeof verified.data.walletBalance === "number") {
++              updateWallet(verified.data.walletBalance);
++            } else {
++              const balance = await walletAPI.getBalance();
++              updateWallet(balance.data.walletBalance);
++            }
++            setAmount("");
++            toast(`₹${val} added to wallet!`);
++            await reloadTransactions();
++          } catch (err: unknown) {
++            toast(errorText(err, "Payment received but the wallet could not be updated. Contact the canteen."));
++          } finally {
++            setTopping(false);
++          }
++        },
++        modal: {
++          ondismiss: () => {
++            setTopping(false);
++          },
++        },
++      });
++      checkout.open();
++    } catch (err: unknown) {
++      toast(errorText(err, "Top-up failed. Try again."));
+       setTopping(false);
+     }
+   };
+diff --git a/server/.env.example b/server/.env.example
+index 1da8b6f..48ac45a 100644
+--- a/server/.env.example
++++ b/server/.env.example
+@@ -1,19 +1,28 @@
+ PORT=5000
+ 
++# "development" on your laptop, "production" when deployed (turns on the stricter safety checks).
++NODE_ENV=development
++
+ # Leave empty to use the built-in local store (persists in server/.data).
+ # For a hosted deployment set a full MongoDB connection string.
+ MONGODB_URI=
+ 
+-# Use a long random value in production.
++# REQUIRED in production: a random value of at least 32 characters. The server refuses to start without it.
++# Create one with:  node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+ JWT_SECRET=change-this-to-a-long-random-secret-in-production
+ 
+-# Allowed frontend origin for CORS and Socket.IO.
++# Allowed frontend origin(s) for CORS in production (comma separated). Development allows any origin.
+ CLIENT_URL=http://localhost:3000
++# Number of proxy hops in front of the server (Render = 1). Used for rate limiting.
++# TRUST_PROXY=1
+ 
+-# Initial administrator, created only when no admin exists.
++# Initial administrator, created only when no admin exists. REQUIRED in production.
+ ADMIN_EMAIL=admin@foodflow.app
+ ADMIN_PASSWORD=Admin@12345
+ 
++# Development helper (ignored in production): creates owner@foodflow.demo / Owner@12345 with the first canteen.
++# SEED_DEMO_OWNER=true
++
+ # Optional: absolute path for uploaded images. Defaults to server/uploads.
+ # UPLOAD_DIR=
+ 
+diff --git a/server/package-lock.json b/server/package-lock.json
+index 0b61744..78b22d4 100644
+--- a/server/package-lock.json
++++ b/server/package-lock.json
+@@ -13,6 +13,7 @@
+         "cors": "^2.8.5",
+         "dotenv": "^17.2.0",
+         "express": "^5.1.0",
++        "express-rate-limit": "^8.7.5",
+         "helmet": "^8.1.0",
+         "jsonwebtoken": "^9.0.2",
+         "mongodb-memory-server": "^10.1.4",
+@@ -885,6 +886,48 @@
+         "url": "https://opencollective.com/express"
+       }
+     },
++    "node_modules/express-rate-limit": {
++      "version": "8.7.5",
++      "resolved": "https://registry.npmjs.org/express-rate-limit/-/express-rate-limit-8.7.5.tgz",
++      "integrity": "sha512-wi+v38cx2EqD0JnhE/e74o5tFqKWUOAPFJIgyEiqJ8v2MNpoOAA3kI2hXYOI+YM+HE5yqbdAlVxm2GqOIeYOgA==",
++      "license": "MIT",
++      "dependencies": {
++        "debug": "^4.4.3",
++        "ip-address": "^10.2.0"
++      },
++      "engines": {
++        "node": ">= 16"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/express-rate-limit"
++      },
++      "peerDependencies": {
++        "express": ">= 4.11"
++      }
++    },
++    "node_modules/express-rate-limit/node_modules/debug": {
++      "version": "4.4.3",
++      "resolved": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
++      "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==",
++      "license": "MIT",
++      "dependencies": {
++        "ms": "^2.1.3"
++      },
++      "engines": {
++        "node": ">=6.0"
++      },
++      "peerDependenciesMeta": {
++        "supports-color": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/express-rate-limit/node_modules/ms": {
++      "version": "2.1.3",
++      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
++      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
++      "license": "MIT"
++    },
+     "node_modules/express/node_modules/debug": {
+       "version": "4.4.3",
+       "resolved": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
+@@ -1198,6 +1241,15 @@
+       "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==",
+       "license": "ISC"
+     },
++    "node_modules/ip-address": {
++      "version": "10.7.6",
++      "resolved": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.6.tgz",
++      "integrity": "sha512-00LYkM6byILa9eQIx6qoaXCM40xTLd56AZ4vyaPW3YTyb49VZYPo5xsiAq4tuQ54GH4R7gVdYScJ1B7B77PuTg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 12"
++      }
++    },
+     "node_modules/ipaddr.js": {
+       "version": "1.9.1",
+       "resolved": "https://registry.npmjs.org/ipaddr.js/-/ipaddr.js-1.9.1.tgz",
+diff --git a/server/package.json b/server/package.json
+index 5fab49b..95a4020 100644
+--- a/server/package.json
++++ b/server/package.json
+@@ -16,6 +16,7 @@
+     "cors": "^2.8.5",
+     "dotenv": "^17.2.0",
+     "express": "^5.1.0",
++    "express-rate-limit": "^8.7.5",
+     "helmet": "^8.1.0",
+     "jsonwebtoken": "^9.0.2",
+     "mongodb-memory-server": "^10.1.4",
+diff --git a/server/src/controllers/orderController.ts b/server/src/controllers/orderController.ts
+index 8a6b382..296e7ad 100644
+--- a/server/src/controllers/orderController.ts
++++ b/server/src/controllers/orderController.ts
+@@ -176,11 +176,6 @@ export const createOrder = async (req: AuthenticatedRequest, res: Response): Pro
+ 
+     const io = req.app.get("io");
+     if (io) {
+-      io.emit("order:created", {
+-        orderId: order._id,
+-        orderNumber: order.orderNumber,
+-        canteenId: prepared.canteen._id,
+-      });
+       io.to(`canteen-${prepared.canteen._id}`).emit("order:created", {
+         orderId: order._id,
+         orderNumber: order.orderNumber,
+@@ -382,7 +377,9 @@ export const updateOrderStatus = async (req: AuthenticatedRequest, res: Response
+ 
+     const io = req.app.get("io");
+     if (io) {
+-      io.emit("order:updated", { orderId: order._id, status: order.status });
++      if (order.user) {
++        io.to(`user-${order.user}`).emit("order:updated", { orderId: order._id, status: order.status });
++      }
+       io.to(`order-${order._id}`).emit("order:status", {
+         status: order.status,
+         paymentStatus: order.paymentStatus,
+diff --git a/server/src/controllers/paymentController.ts b/server/src/controllers/paymentController.ts
+index 321960f..5095080 100644
+--- a/server/src/controllers/paymentController.ts
++++ b/server/src/controllers/paymentController.ts
+@@ -253,7 +253,9 @@ export const verifyOnlinePayment = async (req: AuthenticatedRequest, res: Respon
+     const paid = result.order || order;
+     const io = req.app.get("io");
+     if (io) {
+-      io.emit("order:updated", { orderId: paid._id, status: paid.status, paymentStatus: "PAID" });
++      if (paid.user) {
++        io.to(`user-${paid.user}`).emit("order:updated", { orderId: paid._id, status: paid.status, paymentStatus: "PAID" });
++      }
+       io.to(`order-${paid._id}`).emit("order:status", { status: paid.status, paymentStatus: "PAID" });
+       if (paid.canteen) {
+         io.to(`canteen-${paid.canteen}`).emit("order:created", {
+diff --git a/server/src/controllers/publicController.ts b/server/src/controllers/publicController.ts
+index abc1d53..27b752e 100644
+--- a/server/src/controllers/publicController.ts
++++ b/server/src/controllers/publicController.ts
+@@ -92,6 +92,19 @@ export const createPublicOrder = async (req: Request, res: Response): Promise<vo
+       return;
+     }
+ 
++    const openUnpaid = await Order.countDocuments({
++      orderSource: "GUEST",
++      guestPhone: validation.data.guestPhone,
++      paymentStatus: "PENDING",
++      status: { $in: ["PLACED", "PREPARING", "READY"] },
++    });
++    if (openUnpaid >= 3) {
++      res.status(429).json({
++        error: "You already have 3 unpaid orders. Please collect and pay for them at the counter first.",
++      });
++      return;
++    }
++
+     const prepared = await prepareOrder({
+       items: validation.data.items,
+       canteenId: canteen._id.toString(),
+diff --git a/server/src/seedIfEmpty.ts b/server/src/seedIfEmpty.ts
+index 2b797e7..e5c7e00 100644
+--- a/server/src/seedIfEmpty.ts
++++ b/server/src/seedIfEmpty.ts
+@@ -26,16 +26,26 @@ const DEFAULT_MENU = [
+   { name: "Chocolate Shake", description: "Rich chocolate milkshake", category: "Beverages", price: 60, emoji: "🍫", popular: false, available: true, preparationTime: 5, defaultStock: 35 },
+ ];
+ 
++const DEFAULT_ADMIN_PASSWORD = "Admin@12345";
++const DEMO_OWNER_EMAIL = "owner@foodflow.demo";
++const DEMO_OWNER_PASSWORD = "Owner@12345";
++
+ async function ensureAdmin(): Promise<void> {
+   const adminEmail = process.env.ADMIN_EMAIL || "admin@foodflow.app";
+   const existingAdmin = await User.findOne({ role: "ADMIN" });
+   if (existingAdmin) return;
+ 
+-  const adminPassword = process.env.ADMIN_PASSWORD || "Admin@12345";
++  const production = process.env.NODE_ENV === "production";
++  if (production && !process.env.ADMIN_PASSWORD) {
++    console.error("[Seed] No administrator exists and ADMIN_PASSWORD is not set. Set ADMIN_EMAIL and ADMIN_PASSWORD, then restart.");
++    return;
++  }
++
++  const adminPassword = process.env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
+   if (process.env.ADMIN_PASSWORD) {
+     console.warn("[Seed] Admin password read from env - change it after first login.");
+   } else {
+-    console.warn("[Seed] No ADMIN_PASSWORD set, created admin with default password. Set ADMIN_PASSWORD in .env.");
++    console.warn("[Seed] No ADMIN_PASSWORD set, created admin with the default development password. Set ADMIN_PASSWORD in .env.");
+   }
+   const passwordHash = await bcrypt.hash(adminPassword, 10);
+   await User.create({
+@@ -48,12 +58,17 @@ async function ensureAdmin(): Promise<void> {
+   console.log(`[Seed] Created administrator account: ${adminEmail}`);
+ }
+ 
+-async function ensureDemoOwner(): Promise<InstanceType<typeof User>> {
+-  const email = "owner@foodflow.demo";
++/**
++ * The demo owner has a published password, so it is only created on request
++ * (SEED_DEMO_OWNER=true) and never in production.
++ */
++async function ensureDemoOwner(): Promise<InstanceType<typeof User> | null> {
++  if (process.env.SEED_DEMO_OWNER !== "true" || process.env.NODE_ENV === "production") return null;
++  const email = DEMO_OWNER_EMAIL;
+   const existing = await User.findOne({ email });
+   if (existing) return existing;
+ 
+-  const passwordHash = await bcrypt.hash("Owner@12345", 10);
++  const passwordHash = await bcrypt.hash(DEMO_OWNER_PASSWORD, 10);
+   const owner = await User.create({
+     name: "Demo Canteen Owner",
+     email,
+@@ -62,7 +77,7 @@ async function ensureDemoOwner(): Promise<InstanceType<typeof User>> {
+     phone: "+91 90000 00001",
+     walletBalance: 0,
+   });
+-  console.log(`[Seed] Created demo owner: ${email} (Owner@12345)`);
++  console.log(`[Seed] Created demo owner: ${email} (development only)`);
+   return owner;
+ }
+ 
+@@ -72,7 +87,7 @@ async function ensureDefaultCanteen(): Promise<InstanceType<typeof Canteen>> {
+ 
+   const owner = await ensureDemoOwner();
+   const canteen = await Canteen.create({
+-    ownerId: owner._id,
++    ownerId: owner ? owner._id : null,
+     name: "Main Canteen",
+     code: "MAIN",
+     description: "The original campus canteen. Fresh meals, snacks and beverages served all day.",
+@@ -102,8 +117,29 @@ async function ensureDefaultCanteen(): Promise<InstanceType<typeof Canteen>> {
+   return canteen;
+ }
+ 
++/**
++ * In production, any account that still uses a published default password is
++ * deactivated so it cannot be used to log in.
++ */
++async function lockDefaultAccounts(): Promise<void> {
++  if (process.env.NODE_ENV !== "production") return;
++  const known: { email: string; password: string }[] = [
++    { email: DEMO_OWNER_EMAIL, password: DEMO_OWNER_PASSWORD },
++    { email: process.env.ADMIN_EMAIL || "admin@foodflow.app", password: DEFAULT_ADMIN_PASSWORD },
++  ];
++  for (const entry of known) {
++    const user = await User.findOne({ email: entry.email });
++    if (user && user.isActive && (await bcrypt.compare(entry.password, user.passwordHash))) {
++      user.isActive = false;
++      await user.save();
++      console.error(`[Security] ${entry.email} still used a default password and was deactivated. Reset its password directly in the database.`);
++    }
++  }
++}
++
+ export async function seedIfEmpty(): Promise<void> {
+   await ensureAdmin();
++  await lockDefaultAccounts();
+   const canteen = await ensureDefaultCanteen();
+ 
+   const menuCount = await MenuItem.countDocuments();
+diff --git a/server/src/server.ts b/server/src/server.ts
+index 54830e6..72c1745 100644
+--- a/server/src/server.ts
++++ b/server/src/server.ts
+@@ -9,6 +9,7 @@ import dotenv from "dotenv";
+ import cors from "cors";
+ import helmet from "helmet";
+ import compression from "compression";
++import rateLimit from "express-rate-limit";
+ import { connectDB, disconnectDB } from "./config/db.js";
+ import { seedIfEmpty } from "./seedIfEmpty.js";
+ import authRoutes from "./routes/authRoutes.js";
+@@ -26,15 +27,47 @@ import revenueRoutes from "./routes/revenueRoutes.js";
+ import settingsRoutes from "./routes/settingsRoutes.js";
+ import { razorpayWebhook } from "./controllers/paymentController.js";
+ import { uploadsStaticPath } from "./utils/upload.js";
++import { getJwtSecret, verifyToken } from "./utils/auth.js";
++import { Order } from "./models/Order.js";
++import { User } from "./models/User.js";
++import { findCanteenForUser } from "./utils/canteenAccess.js";
++import { isAdminRole, isManagerRole } from "./utils/roles.js";
+ dotenv.config();
+ 
+ const app = express();
+ const server = createServer(app);
+ const PORT: number = process.env.PORT ? parseInt(process.env.PORT, 10) : 5000;
+ 
++const isProduction = process.env.NODE_ENV === "production";
++// Stop at startup (not on the first login) if the signing secret is missing or weak.
++getJwtSecret();
++
++// Behind a hosting proxy (Render) the real visitor IP is needed for rate limiting.
++if (process.env.TRUST_PROXY || isProduction) app.set("trust proxy", Number(process.env.TRUST_PROXY || 1));
++
++const allowedOrigins = (process.env.CLIENT_URL || "http://localhost:3000")
++  .split(",")
++  .map((value) => value.trim())
++  .filter(Boolean);
++
++/**
++ * Development accepts any origin so a phone on the same Wi-Fi can test the app.
++ * Production accepts only CLIENT_URL (comma separated) and the server's own address.
++ */
++const isAllowedOrigin = (origin: string | undefined, host: string | undefined): boolean => {
++  if (!origin) return true;
++  if (!isProduction) return true;
++  if (allowedOrigins.includes(origin)) return true;
++  try {
++    return !!host && new URL(origin).host === host;
++  } catch {
++    return false;
++  }
++};
++
+ const io = new SocketIOServer(server, {
+   cors: {
+-    origin: process.env.CLIENT_URL || "http://localhost:3000",
++    origin: isProduction ? allowedOrigins : true,
+     methods: ["GET", "POST"],
+   },
+ });
+@@ -42,9 +75,34 @@ const io = new SocketIOServer(server, {
+ app.set("io", io);
+ 
+ app.use(helmet());
+-app.use(cors({ origin: true, credentials: true }));
++app.use(
++  cors((req, callback) => {
++    const origin = req.headers.origin as string | undefined;
++    callback(null, { origin: isAllowedOrigin(origin, req.headers.host), credentials: true });
++  })
++);
+ app.use(compression());
+ 
++const limiter = (windowMinutes: number, limit: number, message: string, skipSuccessful = false) =>
++  rateLimit({
++    windowMs: windowMinutes * 60 * 1000,
++    limit,
++    standardHeaders: "draft-7",
++    legacyHeaders: false,
++    skipSuccessfulRequests: skipSuccessful,
++    message: { error: message },
++  });
++
++// Slow down password guessing, fake sign-ups and guest-order spam.
++// A whole campus Wi-Fi can share one public IP address, so these limits are
++// generous: they stop scripts, not students.
++app.use("/api/auth/login", limiter(15, 50, "Too many failed login attempts. Please wait 15 minutes and try again.", true));
++app.use("/api/auth/register", limiter(60, 100, "Too many sign-ups from this network. Please try again later."));
++app.post("/api/public/orders", limiter(10, 60, "Too many orders from this network. Please wait a few minutes."));
++app.use("/api/payments/online/order", limiter(10, 150, "Too many payment attempts. Please wait a few minutes."));
++app.use("/api/wallet/topup", limiter(10, 100, "Too many top-up attempts. Please wait a few minutes."));
++app.use("/api/uploads", limiter(60, 100, "Too many uploads. Please try again later."));
++
+ // Razorpay signs the exact raw request body, so this must be registered before
+ // the JSON parser. The handler verifies the signature before trusting anything.
+ app.post(
+@@ -55,19 +113,55 @@ app.post(
+ 
+ app.use(express.json());
+ 
++// Realtime connections must be signed in and can only join rooms they may see.
++io.use(async (socket, next) => {
++  try {
++    const token = (socket.handshake.auth as { token?: string } | undefined)?.token;
++    if (!token) return next(new Error("Authentication required"));
++    const decoded = verifyToken(token);
++    const user = await User.findById(decoded.userId).select("role isActive");
++    if (!user || !user.isActive) return next(new Error("Account not available"));
++    socket.data.userId = user._id.toString();
++    socket.data.role = user.role;
++    next();
++  } catch {
++    next(new Error("Invalid or expired token"));
++  }
++});
++
+ io.on("connection", (socket) => {
+-  console.log(`[Socket] Client connected: ${socket.id}`);
++  const userId = socket.data.userId as string;
++  const role = socket.data.role as string;
++  // Everyone gets their own private room automatically.
++  socket.join(`user-${userId}`);
+ 
+-  socket.on("join:user", (userId: string) => {
+-    socket.join(`user-${userId}`);
++  socket.on("join:user", (requested: string) => {
++    if (requested === userId) socket.join(`user-${userId}`);
+   });
+ 
+-  socket.on("join:order", (orderId: string) => {
+-    socket.join(`order-${orderId}`);
++  socket.on("join:order", async (orderId: string) => {
++    try {
++      if (!/^[a-f\d]{24}$/i.test(String(orderId))) return;
++      const order = await Order.findById(orderId).select("user canteen");
++      if (!order) return;
++      let allowed = (!!order.user && order.user.toString() === userId) || isAdminRole(role);
++      if (!allowed && isManagerRole(role) && order.canteen) {
++        allowed = !!(await findCanteenForUser({ userId, role: role as never }, order.canteen.toString(), { requireManage: true }));
++      }
++      if (allowed) socket.join(`order-${orderId}`);
++    } catch {
++      // ignore bad requests
++    }
+   });
+ 
+-  socket.on("disconnect", () => {
+-    console.log(`[Socket] Client disconnected: ${socket.id}`);
++  socket.on("join:canteen", async (canteenId: string) => {
++    try {
++      if (!isManagerRole(role) || !/^[a-f\d]{24}$/i.test(String(canteenId))) return;
++      const canteen = await findCanteenForUser({ userId, role: role as never }, String(canteenId), { requireManage: true });
++      if (canteen) socket.join(`canteen-${canteenId}`);
++    } catch {
++      // ignore bad requests
++    }
+   });
+ });
+ 
+diff --git a/server/src/utils/auth.ts b/server/src/utils/auth.ts
+index 562f529..a192bc1 100644
+--- a/server/src/utils/auth.ts
++++ b/server/src/utils/auth.ts
+@@ -1,5 +1,6 @@
+ import jwt from "jsonwebtoken";
+ import bcrypt from "bcryptjs";
++import crypto from "crypto";
+ import type { UserRole } from "../models/User.js";
+ 
+ export interface TokenPayload {
+@@ -7,6 +8,43 @@ export interface TokenPayload {
+   role: UserRole;
+ }
+ 
++const PLACEHOLDER_SECRETS = new Set([
++  "change-this-to-a-long-random-secret-in-production",
++  "fallback_secret_key",
++  "secret",
++]);
++
++let cachedSecret: string | null = null;
++
++/**
++ * The signing secret. In production a missing or weak secret stops the server,
++ * because anyone who knows the default could forge an administrator login.
++ * In development a missing secret gets a random temporary one (logins reset on restart).
++ */
++export function getJwtSecret(): string {
++  if (cachedSecret) return cachedSecret;
++  const configured = process.env.JWT_SECRET?.trim();
++  const production = process.env.NODE_ENV === "production";
++
++  if (configured) {
++    if (production && (configured.length < 32 || PLACEHOLDER_SECRETS.has(configured))) {
++      throw new Error("JWT_SECRET is too weak for production. Use a random value of at least 32 characters.");
++    }
++    if (PLACEHOLDER_SECRETS.has(configured)) {
++      console.warn("[Auth] JWT_SECRET is still the example value. Change it before deploying.");
++    }
++    cachedSecret = configured;
++    return configured;
++  }
++
++  if (production) {
++    throw new Error("JWT_SECRET is not set. Add a long random value to the server environment.");
++  }
++  console.warn("[Auth] JWT_SECRET is not set. Using a temporary random secret; everyone is logged out when the server restarts.");
++  cachedSecret = crypto.randomBytes(48).toString("hex");
++  return cachedSecret;
++}
++
+ export const hashPassword = async (password: string): Promise<string> => {
+   const salt = await bcrypt.genSalt(10);
+   return bcrypt.hash(password, salt);
+@@ -17,11 +55,9 @@ export const comparePassword = async (password: string, hash: string): Promise<b
+ };
+ 
+ export const generateToken = (payload: TokenPayload): string => {
+-  const secret = process.env.JWT_SECRET || "fallback_secret_key";
+-  return jwt.sign(payload, secret, { expiresIn: "7d" });
++  return jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
+ };
+ 
+ export const verifyToken = (token: string): TokenPayload => {
+-  const secret = process.env.JWT_SECRET || "fallback_secret_key";
+-  return jwt.verify(token, secret) as TokenPayload;
++  return jwt.verify(token, getJwtSecret()) as TokenPayload;
+ };
+diff --git a/server/src/utils/validation.ts b/server/src/utils/validation.ts
+index 9ab2dc0..6fd434f 100644
+--- a/server/src/utils/validation.ts
++++ b/server/src/utils/validation.ts
+@@ -4,6 +4,11 @@ const objectId = z.string().regex(/^[a-f\d]{24}$/i, "Invalid identifier");
+ const hexColor = z.string().regex(/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/, "Use a valid hex colour");
+ const optionalUrl = z.string().max(2048).nullable().optional();
+ 
++const phoneNumber = z
++  .string()
++  .trim()
++  .regex(/^[+]?[0-9][0-9\s-]{8,14}$/, "Enter a valid phone number");
++
+ export const registerSchema = z.object({
+   name: z.string().min(2, "Name must be at least 2 characters"),
+   email: z.string().email("Invalid email format"),
+@@ -79,7 +84,7 @@ export const publicOrderSchema = z.object({
+   canteenCode: z.string().max(24).optional(),
+   items: z.array(orderItemSchema).min(1, "At least one item is required"),
+   guestName: z.string().min(1, "Your name is required").max(80),
+-  guestPhone: z.string().max(30).optional(),
++  guestPhone: phoneNumber,
+   notes: z.string().max(500).optional(),
+ });
+ 
+-- 
+2.43.0
+

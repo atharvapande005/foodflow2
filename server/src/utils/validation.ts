@@ -4,6 +4,11 @@ const objectId = z.string().regex(/^[a-f\d]{24}$/i, "Invalid identifier");
 const hexColor = z.string().regex(/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/, "Use a valid hex colour");
 const optionalUrl = z.string().max(2048).nullable().optional();
 
+const phoneNumber = z
+  .string()
+  .trim()
+  .regex(/^[+]?[0-9][0-9\s-]{8,14}$/, "Enter a valid phone number");
+
 export const registerSchema = z.object({
   name: z.string().min(2, "Name must be at least 2 characters"),
   email: z.string().email("Invalid email format"),
@@ -79,7 +84,7 @@ export const publicOrderSchema = z.object({
   canteenCode: z.string().max(24).optional(),
   items: z.array(orderItemSchema).min(1, "At least one item is required"),
   guestName: z.string().min(1, "Your name is required").max(80),
-  guestPhone: z.string().max(30).optional(),
+  guestPhone: phoneNumber,
   notes: z.string().max(500).optional(),
 });
 
